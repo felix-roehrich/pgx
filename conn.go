@@ -1327,16 +1327,24 @@ func (c *Conn) LoadType(ctx context.Context, typeName string) (*pgtype.Type, err
 }
 
 func (c *Conn) LoadTypes(ctx context.Context, typeNames []string) ([]*pgtype.Type, error) {
-	var b Batch
+	typeMap := make(map[uint32]*pgtype.Type, len(typeNames))
+	lookup := func(oid uint32) (*pgtype.Type, bool) {
+		t, ok := c.TypeMap().TypeForOID(oid)
+		if !ok {
+			t, ok = typeMap[oid]
+			return t, ok
+		}
 
-	var types []*pgtype.Type
+		return t, true
+	}
+
+	var b Batch
 	var elemBatch Batch
 	for _, name := range typeNames {
 		b.Queue("select oid, typtype::text from pg_type where oid=$1::regtype::oid", name).QueryRow(func(r Row) error {
 			var (
-				t           pgtype.Type
-				typtype     string
-				typbasetype uint32
+				t       pgtype.Type
+				typtype string
 			)
 
 			if err := r.Scan(&t.OID, &typtype); err != nil {
@@ -1347,7 +1355,7 @@ func (c *Conn) LoadTypes(ctx context.Context, typeNames []string) ([]*pgtype.Typ
 			case "b": // array
 				t.Name = name
 				t.Codec = &pgtype.ArrayCodec{}
-				c.TypeMap().RegisterType(&t)
+				typeMap[t.OID] = &t
 
 				elemBatch.Queue("select typelem from pg_type where oid=$1", t.OID).QueryRow(func(r Row) error {
 					var elemOID uint32
@@ -1355,18 +1363,19 @@ func (c *Conn) LoadTypes(ctx context.Context, typeNames []string) ([]*pgtype.Typ
 						return err
 					}
 
-					dt, ok := c.TypeMap().TypeForOID(elemOID)
+					dt, ok := lookup(elemOID)
 					if !ok {
 						return errors.New("array element OID not registered")
 					}
 
 					t.Codec.(*pgtype.ArrayCodec).ElementType = dt
+					c.TypeMap().RegisterType(&t)
 					return nil
 				})
 			case "c": // composite
 				t.Name = name
 				t.Codec = &pgtype.CompositeCodec{}
-				c.TypeMap().RegisterType(&t)
+				typeMap[t.OID] = &t
 
 				elemBatch.Queue(
 					"with rel as (select typrelid as id from pg_type where oid=$1)"+
@@ -1382,7 +1391,7 @@ func (c *Conn) LoadTypes(ctx context.Context, typeNames []string) ([]*pgtype.Typ
 					)
 
 					_, err := ForEachRow(rows, []any{&fieldName, &fieldOID}, func() error {
-						dt, ok := c.TypeMap().TypeForOID(fieldOID)
+						dt, ok := lookup(fieldOID)
 						if !ok {
 							return fmt.Errorf("unknown composite type field OID: %v", fieldOID)
 						}
@@ -1394,11 +1403,12 @@ func (c *Conn) LoadTypes(ctx context.Context, typeNames []string) ([]*pgtype.Typ
 					}
 
 					t.Codec.(*pgtype.CompositeCodec).Fields = fields
+					c.TypeMap().RegisterType(&t)
 					return nil
 				})
 			case "d": // domain
 				t.Name = name
-				c.TypeMap().RegisterType(&t)
+				typeMap[t.OID] = &t
 
 				elemBatch.Queue("select typbasetype from pg_type where oid=$1", t.OID).QueryRow(func(row Row) error {
 					var baseTypeOID uint32
@@ -1406,12 +1416,13 @@ func (c *Conn) LoadTypes(ctx context.Context, typeNames []string) ([]*pgtype.Typ
 						return err
 					}
 
-					dt, ok := c.TypeMap().TypeForOID(typbasetype)
+					dt, ok := lookup(baseTypeOID)
 					if !ok {
 						return errors.New("domain base type OID not registered")
 					}
 
 					t.Codec = dt.Codec
+					c.TypeMap().RegisterType(&t)
 					return nil
 				})
 			case "e": // enum
@@ -1421,7 +1432,7 @@ func (c *Conn) LoadTypes(ctx context.Context, typeNames []string) ([]*pgtype.Typ
 			case "r": // range
 				t.Name = name
 				t.Codec = &pgtype.RangeCodec{}
-				c.TypeMap().RegisterType(&t)
+				typeMap[t.OID] = &t
 
 				elemBatch.Queue("select rngsubtype from pg_range where rngtypid=$1", t.OID).QueryRow(func(r Row) error {
 					var elemOID uint32
@@ -1429,18 +1440,19 @@ func (c *Conn) LoadTypes(ctx context.Context, typeNames []string) ([]*pgtype.Typ
 						return err
 					}
 
-					dt, ok := c.TypeMap().TypeForOID(elemOID)
+					dt, ok := lookup(elemOID)
 					if !ok {
 						return errors.New("range element OID not registered")
 					}
 
 					t.Codec.(*pgtype.RangeCodec).ElementType = dt
+					c.TypeMap().RegisterType(&t)
 					return nil
 				})
 			case "m": // multirange
 				t.Name = name
 				t.Codec = &pgtype.MultirangeCodec{}
-				c.TypeMap().RegisterType(&t)
+				typeMap[t.OID] = &t
 
 				elemBatch.Queue("select rngtypid from pg_range where rngmultitypid=$1", t.OID).QueryRow(func(r Row) error {
 					var elemOID uint32
@@ -1448,12 +1460,13 @@ func (c *Conn) LoadTypes(ctx context.Context, typeNames []string) ([]*pgtype.Typ
 						return err
 					}
 
-					dt, ok := c.TypeMap().TypeForOID(elemOID)
+					dt, ok := lookup(elemOID)
 					if !ok {
 						return errors.New("multirange element OID not registered")
 					}
 
 					t.Codec.(*pgtype.MultirangeCodec).ElementType = dt
+					c.TypeMap().RegisterType(&t)
 					return nil
 				})
 			}
@@ -1468,6 +1481,11 @@ func (c *Conn) LoadTypes(ctx context.Context, typeNames []string) ([]*pgtype.Typ
 
 	if r := c.SendBatch(ctx, &elemBatch); r.Close() != nil {
 		return nil, r.Close()
+	}
+
+	types := make([]*pgtype.Type, 0, len(typeNames))
+	for _, t := range typeMap {
+		types = append(types, t)
 	}
 
 	return types, nil

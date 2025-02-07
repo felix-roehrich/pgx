@@ -1418,3 +1418,13 @@ func TestErrNoRows(t *testing.T) {
 
 	require.ErrorIs(t, pgx.ErrNoRows, sql.ErrNoRows, "pgx.ErrNowRows must match sql.ErrNoRows")
 }
+
+func TestLoadTypes(t *testing.T) {
+	defaultConnTestRunner.RunTest(context.Background(), t, func(ctx context.Context, t testing.TB, conn *pgx.Conn) {
+		_, err := conn.Exec(ctx, "create type enum_test as enum ('foo', 'bar', 'baz')")
+		require.NoError(t, err)
+
+		_, err = conn.LoadTypes(ctx, []string{"enum_test", "enum_test[]"})
+		require.NoError(t, err)
+	})
+}
