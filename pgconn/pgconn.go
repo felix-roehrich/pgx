@@ -32,6 +32,12 @@ const (
 	connStatusBusy
 )
 
+const (
+	encryptionMethodError     = 0x00
+	encryptionMethodPlaintext = 0x01
+	encryptionMethodSSL       = 0x04
+)
+
 // Notice represents a notice response message reported by the PostgreSQL server. Be aware that this is distinct from
 // LISTEN/NOTIFY notification.
 type Notice PgError
@@ -198,6 +204,7 @@ func buildConnectOneConfigs(ctx context.Context, config *Config) ([]*connectOneC
 				address:          address,
 				originalHostname: fb.Host,
 				tlsConfig:        fb.TLSConfig,
+				sslmode:          config.SSLMode,
 			})
 
 			continue
@@ -222,6 +229,7 @@ func buildConnectOneConfigs(ctx context.Context, config *Config) ([]*connectOneC
 					address:          address,
 					originalHostname: fb.Host,
 					tlsConfig:        fb.TLSConfig,
+					sslmode:          config.SSLMode,
 				})
 			} else {
 				network, address := NetworkAddress(ip, fb.Port)
@@ -230,6 +238,7 @@ func buildConnectOneConfigs(ctx context.Context, config *Config) ([]*connectOneC
 					address:          address,
 					originalHostname: fb.Host,
 					tlsConfig:        fb.TLSConfig,
+					sslmode:          config.SSLMode,
 				})
 			}
 		}
@@ -259,30 +268,33 @@ func connectPreferred(ctx context.Context, config *Config, connectOneConfigs []*
 			ctx = octx
 		}
 
-		pgConn, err := connectOne(ctx, config, c, false)
-		if pgConn != nil {
-			return pgConn, nil
-		}
-
-		allErrors = append(allErrors, err)
-
-		var pgErr *PgError
-		if errors.As(err, &pgErr) {
-			const ERRCODE_INVALID_PASSWORD = "28P01"                    // wrong password
-			const ERRCODE_INVALID_AUTHORIZATION_SPECIFICATION = "28000" // wrong password or bad pg_hba.conf settings
-			const ERRCODE_INVALID_CATALOG_NAME = "3D000"                // db does not exist
-			const ERRCODE_INSUFFICIENT_PRIVILEGE = "42501"              // missing connect privilege
-			if pgErr.Code == ERRCODE_INVALID_PASSWORD ||
-				pgErr.Code == ERRCODE_INVALID_AUTHORIZATION_SPECIFICATION && c.tlsConfig != nil ||
-				pgErr.Code == ERRCODE_INVALID_CATALOG_NAME ||
-				pgErr.Code == ERRCODE_INSUFFICIENT_PRIVILEGE {
-				return nil, allErrors
+		c.initAllowedEncryptionMethods()
+		for c.currentEncryptionMethod != encryptionMethodError {
+			pgConn, err := connectOne(ctx, config, c, false)
+			if pgConn != nil {
+				return pgConn, nil
 			}
-		}
+			allErrors = append(allErrors, err)
 
-		var npErr *NotPreferredError
-		if errors.As(err, &npErr) {
-			fallbackConnectOneConfig = c
+			var pgErr *PgError
+			if errors.As(err, &pgErr) {
+				const ERRCODE_INVALID_CATALOG_NAME = "3D000"   // db does not exist
+				const ERRCODE_INSUFFICIENT_PRIVILEGE = "42501" // missing connect privilege
+
+				// auth ok, but db does not exist or user has no permission
+				if pgErr.Code == ERRCODE_INVALID_CATALOG_NAME || pgErr.Code == ERRCODE_INSUFFICIENT_PRIVILEGE {
+					return nil, allErrors
+				}
+			}
+
+			var npErr *NotPreferredError
+			if errors.As(err, &npErr) {
+				fallbackConnectOneConfig = c
+				break
+			} else {
+				c.failedEncryptionMethods |= c.currentEncryptionMethod
+				c.selectNextEncryptionMethod()
+			}
 		}
 	}
 
@@ -319,7 +331,12 @@ func connectOne(ctx context.Context, config *Config, connectConfig *connectOneCo
 		return nil, newPerDialConnectError("dial error", err)
 	}
 
-	if connectConfig.tlsConfig != nil {
+	if connectConfig.currentEncryptionMethod&encryptionMethodSSL != 0 {
+		if config.TLSConfig == nil {
+			pgConn.conn.Close()
+			return nil, newPerDialConnectError("tls error", errors.New("TLSConfig is nil"))
+		}
+
 		pgConn.contextWatcher = ctxwatch.NewContextWatcher(&DeadlineContextWatcherHandler{Conn: pgConn.conn})
 		pgConn.contextWatcher.Watch(ctx)
 		tlsConn, err := startTLS(pgConn.conn, connectConfig.tlsConfig)

@@ -35,6 +35,7 @@ type Config struct {
 	Database       string
 	User           string
 	Password       string
+	SSLMode        string
 	TLSConfig      *tls.Config // nil disables TLS
 	ConnectTimeout time.Duration
 	DialFunc       DialFunc   // e.g. net.Dialer.DialContext
@@ -124,6 +125,71 @@ type connectOneConfig struct {
 	address          string
 	originalHostname string      // original hostname before resolving
 	tlsConfig        *tls.Config // nil disables TLS
+
+	sslmode                  string
+	allowedEncryptionMethods int
+	failedEncryptionMethods  int
+	currentEncryptionMethod  int
+}
+
+func (c *connectOneConfig) initAllowedEncryptionMethods() bool {
+	if c.network == "unix" {
+		// do not request encryption for Unix sockets
+		c.allowedEncryptionMethods = encryptionMethodPlaintext
+		c.currentEncryptionMethod = encryptionMethodPlaintext
+		return true
+	}
+
+	c.allowedEncryptionMethods = 0
+
+	if c.sslmode != "disable" {
+		c.allowedEncryptionMethods |= encryptionMethodSSL
+	}
+
+	if c.sslmode == "disable" || c.sslmode == "prefer" || c.sslmode == "allow" {
+		c.allowedEncryptionMethods |= encryptionMethodPlaintext
+	}
+
+	return c.selectNextEncryptionMethod()
+}
+
+func (c *connectOneConfig) selectNextEncryptionMethod() bool {
+	remainingMethods := c.allowedEncryptionMethods &^ c.failedEncryptionMethods
+
+	if newGSS != nil {
+		if remainingMethods&encryptionMethodGSSAPI != 0 {
+			c.currentEncryptionMethod = encryptionMethodGSSAPI
+			return true
+		}
+	}
+
+	// The order between SSL encryption and plaintext depends on sslmode. With
+	// sslmode=allow, try plaintext connection before SSL. With
+	// sslmode=prefer, it's the other way round. With other modes, we only try
+	// plaintext or SSL connections so the order they're listed here doesn't
+	// matter.
+
+	if c.sslmode == "allow" {
+		if remainingMethods&encryptionMethodPlaintext != 0 {
+			c.currentEncryptionMethod = encryptionMethodPlaintext
+			return true
+		}
+	}
+
+	if remainingMethods&encryptionMethodSSL != 0 {
+		c.currentEncryptionMethod = encryptionMethodSSL
+		return true
+	}
+
+	if c.sslmode != "allow" {
+		if remainingMethods&encryptionMethodPlaintext != 0 {
+			c.currentEncryptionMethod = encryptionMethodPlaintext
+			return true
+		}
+	}
+
+	c.currentEncryptionMethod = encryptionMethodError
+	return false
 }
 
 // isAbsolutePath checks if the provided value is an absolute path either
@@ -360,20 +426,13 @@ func ParseConfigWithOptions(connString string, options ParseConfigOptions) (*Con
 			return nil, &ParseConfigError{ConnString: connString, msg: "invalid port", err: err}
 		}
 
-		var tlsConfigs []*tls.Config
-
 		// Ignore TLS settings if Unix domain socket like libpq
-		if network, _ := NetworkAddress(host, port); network == "unix" {
-			tlsConfigs = append(tlsConfigs, nil)
-		} else {
-			var err error
-			tlsConfigs, err = configTLS(settings, host, options)
+		if network, _ := NetworkAddress(host, port); network != "unix" {
+			tlsConfig, err := configTLS(settings, host, options)
 			if err != nil {
 				return nil, &ParseConfigError{ConnString: connString, msg: "failed to configure TLS", err: err}
 			}
-		}
 
-		for _, tlsConfig := range tlsConfigs {
 			fallbacks = append(fallbacks, &FallbackConfig{
 				Host:      host,
 				Port:      port,
@@ -638,7 +697,7 @@ func parseServiceSettings(servicefilePath, serviceName string) (map[string]strin
 // configTLS uses libpq's TLS parameters to construct  []*tls.Config. It is
 // necessary to allow returning multiple TLS configs as sslmode "allow" and
 // "prefer" allow fallback.
-func configTLS(settings map[string]string, thisHost string, parseConfigOptions ParseConfigOptions) ([]*tls.Config, error) {
+func configTLS(settings map[string]string, thisHost string, parseConfigOptions ParseConfigOptions) (*tls.Config, error) {
 	host := thisHost
 	sslmode := settings["sslmode"]
 	sslrootcert := settings["sslrootcert"]
@@ -689,7 +748,7 @@ func configTLS(settings map[string]string, thisHost string, parseConfigOptions P
 
 	switch sslmode {
 	case "disable":
-		return []*tls.Config{nil}, nil
+		return nil, nil
 	case "allow", "prefer":
 		tlsConfig.InsecureSkipVerify = true
 	case "require":
@@ -811,11 +870,11 @@ func configTLS(settings map[string]string, thisHost string, parseConfigOptions P
 
 	switch sslmode {
 	case "allow":
-		return []*tls.Config{nil, tlsConfig}, nil
+		return tlsConfig, nil
 	case "prefer":
-		return []*tls.Config{tlsConfig, nil}, nil
+		return tlsConfig, nil
 	case "require", "verify-ca", "verify-full":
-		return []*tls.Config{tlsConfig}, nil
+		return tlsConfig, nil
 	default:
 		panic("BUG: bad sslmode should already have been caught")
 	}
