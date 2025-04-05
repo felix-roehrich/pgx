@@ -1410,7 +1410,7 @@ func (c *Conn) LoadTypes(ctx context.Context, typeNames []string) ([]*pgtype.Typ
 				t.Name = name
 				typeMap[t.OID] = &t
 
-				elemBatch.Queue("select typbasetype from pg_type where oid=$1", t.OID).QueryRow(func(row Row) error {
+				elemBatch.Queue("select typbasetype from pg_type where oid=$1", t.OID).QueryRow(func(r Row) error {
 					var baseTypeOID uint32
 					if err := r.Scan(&baseTypeOID); err != nil {
 						return err
